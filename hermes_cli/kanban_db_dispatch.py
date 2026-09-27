@@ -14,6 +14,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -2468,9 +2469,65 @@ def _rotate_worker_log(
 
 
 def _module_hermes_argv() -> list[str]:
-    """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    """Installation-bound Hermes CLI invocation (``hermes_cli.main`` is the
+    console-script target — there is no top-level ``hermes`` package).
+
+    ``python -m hermes_cli.main`` resolves only while ``hermes_cli`` sits in
+    the interpreter's own environment (venv installs) or cwd is the install
+    root — a worker spawned into a task workspace dies in under a second with
+    ``ModuleNotFoundError: hermes_cli``. Order: this interpreter's module
+    form when it imports the package standalone; else ``runtime_command``'s
+    sealed bootstrap (store Python leases dependencies, pins the root in the
+    child's ``sys.path``); else inject this tree's root directly into the
+    child (test/CI venvs that carry their own dependencies). Never cwd."""
+    module_argv = [sys.executable, "-m", "hermes_cli.main"]
+    if _interpreter_imports_hermes_cli(sys.executable):
+        return module_argv
+    root = Path(__file__).resolve().parent.parent
+    try:
+        from hermes_cli._launchers import resolve_store_python, runtime_command
+
+        if resolve_store_python(root) is not None:
+            argv = runtime_command(root, module="hermes_cli.main")
+            if argv and os.path.isfile(argv[0]):
+                return argv
+    except Exception:
+        pass
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        (
+            f"import sys, runpy; sys.path.insert(0, {str(root)!r}); "
+            "runpy.run_module('hermes_cli.main', run_name='__main__', alter_sys=True)"
+        ),
+    ]
+
+
+_IMPORTS_HERMES_CLI: dict[str, bool] = {}
+
+
+def _interpreter_imports_hermes_cli(python: str) -> bool:
+    """Whether ``python`` can ``import hermes_cli`` from a foreign cwd with
+    the environment neutralized — the smallest mirror of the child the
+    dispatcher spawns. Cached per interpreter."""
+    cached = _IMPORTS_HERMES_CLI.get(python)
+    if cached is None:
+        probe = (
+            "import importlib.util; "
+            "raise SystemExit(0 if importlib.util.find_spec('hermes_cli') else 1)"
+        )
+        try:
+            cached = subprocess.run(
+                [python, "-I", "-c", probe],
+                cwd=tempfile.gettempdir(),
+                capture_output=True,
+                timeout=30,
+            ).returncode == 0
+        except Exception:
+            cached = False
+        _IMPORTS_HERMES_CLI[python] = cached
+    return cached
 
 
 def _absolute_hermes_path(path: str) -> str:

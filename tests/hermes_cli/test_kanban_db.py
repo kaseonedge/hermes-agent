@@ -1569,24 +1569,39 @@ def test_connect_heals_reduced_tasks_schema_seeded_by_external_harness(kanban_ho
 # launchd jobs, and other detached processes routinely run with a stripped
 # $PATH that doesn't include the venv's bin/, so a bare `["hermes", ...]`
 # spawn fails with FileNotFoundError and the task gets stuck. The resolver
-# prefers the interpreter-bound module form (exactly this install; a PATH
-# shim could be attacker-planted or belong to another install, #111569) and
-# only falls back to the PATH shim when ``hermes_cli`` is not importable.
+# prefers an installation-bound form (exactly this install; a PATH shim could
+# be attacker-planted or belong to another install, #111569) and only falls
+# back to the PATH shim when ``hermes_cli`` is not importable. It must ALSO
+# survive an arbitrary cwd: workers spawn into task workspaces, and the bare
+# `python -m hermes_cli.main` form resolves from a store-python tree only
+# while cwd is the install root (else the worker dies in under a second with
+# ``ModuleNotFoundError: hermes_cli``). See test_..._actually_runs below.
 # ---------------------------------------------------------------------------
 
 
 def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
     """A `hermes` on PATH must not shadow the running install (#111569):
-    the module argv wins whenever ``hermes_cli`` is importable; only an
-    explicit ``$HERMES_BIN`` overrides it."""
+    the installation-bound form wins whenever ``hermes_cli`` is importable;
+    only an explicit ``$HERMES_BIN`` overrides it."""
+    import os
     import shutil
     import sys
+    from pathlib import Path
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
     monkeypatch.setattr(shutil, "which", lambda name: "/tmp/planted/hermes")
     monkeypatch.setattr(kbd, "_safe_which_no_cwd", lambda name: "/tmp/planted/hermes")
-    assert kbd._resolve_hermes_argv() == [sys.executable, "-m", "hermes_cli.main"]
+    argv = kbd._resolve_hermes_argv()
+    assert "/tmp/planted/hermes" not in argv
+    if "-m" in argv:
+        # interpreter env carries hermes_cli (venv / pip install)
+        assert argv == [sys.executable, "-m", "hermes_cli.main"]
+    else:
+        # sealed bootstrap pinned to THIS tree's root
+        root = str(Path(kbd.__file__).resolve().parent.parent)
+        assert "-c" in argv
+        assert root in " ".join(argv)
 
     monkeypatch.setenv("HERMES_BIN", "/opt/hermes/bin/hermes")
     assert kbd._resolve_hermes_argv() == ["/opt/hermes/bin/hermes"]
@@ -1595,15 +1610,16 @@ def test_resolve_hermes_argv_prefers_module_form_over_path_shim(monkeypatch):
 
 
 def test_resolve_hermes_argv_module_actually_runs():
-    """The fallback module name must be importable + runnable.
+    """The spawn invocation must start from ANY cwd with a scrubbed env.
 
-    A unit test that pins the literal string is necessary but not
-    sufficient — if `hermes_cli.main` ever loses `if __name__ == "__main__"`
-    handling or its argparse setup, `python -m hermes_cli.main --version`
-    would fail and so would every dispatcher spawn that hits the fallback.
-    Run it as a real subprocess to catch that regression.
+    The dispatcher spawns workers into task workspaces with
+    ``build_subprocess_env`` output — no Hermes-owned ``PYTHONPATH``. A unit
+    test pinning the literal string is necessary but not sufficient; run the
+    resolved argv as a real subprocess from a foreign cwd to catch the
+    ``ModuleNotFoundError: hermes_cli`` startup failure.
     """
     import subprocess
+    import tempfile
     from hermes_cli import kanban_db_dispatch as kbd
     import shutil
     import unittest.mock as mock
@@ -1612,10 +1628,18 @@ def test_resolve_hermes_argv_module_actually_runs():
         os.environ.pop("HERMES_BIN", None)
         with mock.patch.object(shutil, "which", return_value=None):
             argv = kbd._resolve_hermes_argv()
-    r = subprocess.run(argv + ["--version"], capture_output=True, text=True, timeout=30)
+    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+    r = subprocess.run(
+        argv + ["--version"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=tempfile.gettempdir(),
+        env=env,
+    )
     assert r.returncode == 0, (
-        f"`{' '.join(argv)} --version` failed (rc={r.returncode}); "
-        f"stderr={r.stderr[:200]!r}"
+        f"`{' '.join(argv)} --version` failed (rc={r.returncode}) from a "
+        f"foreign cwd; stderr={r.stderr[:200]!r}"
     )
 
 
